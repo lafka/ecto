@@ -12,11 +12,13 @@ defmodule Ecto.Embedded do
                        owner: atom,
                        on_cast: nil | fun,
                        related: atom,
-                       unique: boolean}
+                       unique: boolean,
+                       persist: :map | :list}
 
   @behaviour Relation
   @on_replace_opts [:raise, :mark_as_invalid, :delete]
   @embeds_one_on_replace_opts @on_replace_opts ++ [:update]
+  @persist_opts [:list, :map]
 
   defstruct [
     :cardinality,
@@ -26,7 +28,8 @@ defmodule Ecto.Embedded do
     :on_cast,
     on_replace: :raise,
     unique: true,
-    ordered: true
+    ordered: true,
+    persist: :list
   ]
 
   ## Parameterized API
@@ -38,7 +41,9 @@ defmodule Ecto.Embedded do
 
   @impl Ecto.ParameterizedType
   def init(opts) do
-    opts = Keyword.put_new(opts, :on_replace, :raise)
+    opts = opts
+      |> Keyword.put_new(:on_replace, :raise)
+      |> Keyword.put_new(:persist, :list)
     cardinality = Keyword.fetch!(opts, :cardinality)
 
     on_replace_opts =
@@ -48,6 +53,13 @@ defmodule Ecto.Embedded do
       raise ArgumentError, "invalid `:on_replace` option for #{inspect Keyword.fetch!(opts, :field)}. " <>
         "The only valid options are: " <>
         Enum.map_join(@on_replace_opts, ", ", &"`#{inspect &1}`")
+    end
+
+    unless opts[:persist] in @persist_opts do
+      raise ArgumentError,
+            "invalid `:persist` option for #{inspect Keyword.fetch!(opts, :field)}. " <>
+              "The only valid options are: " <>
+              Enum.map_join(@persist_opts, ", ", &"`#{inspect &1 }`")
     end
 
     struct(%Embedded{}, opts)
@@ -62,8 +74,14 @@ defmodule Ecto.Embedded do
 
   def load(nil, _fun, %{cardinality: :many}), do: {:ok, []}
 
-  def load(value, fun, %{cardinality: :many, related: schema, field: field}) when is_list(value) do
+  def load(value, fun, %{cardinality: :many, related: schema, field: field, persist: :list})
+      when is_list(value) do
     {:ok, Enum.map(value, &load(field, schema, &1, fun))}
+  end
+
+  def load(value, fun, %{cardinality: :many, related: schema, field: field, persist: :map})
+      when is_map(value) do
+    {:ok, Enum.into(value, %{}, fn {k, v} -> {k, load(field, schema, v, fun)} end)}
   end
 
   def load(_value, _fun, _embed) do
@@ -85,9 +103,16 @@ defmodule Ecto.Embedded do
     {:ok, dump(field, schema, value, schema.__schema__(:dump), fun)}
   end
 
-  def dump(value, fun, %{cardinality: :many, related: schema, field: field}) when is_list(value) do
+  def dump(value, fun, %{cardinality: :many, related: schema, field: field, persist: :list})
+      when is_list(value) do
     types = schema.__schema__(:dump)
     {:ok, Enum.map(value, &dump(field, schema, &1, types, fun))}
+  end
+
+  def dump(value, fun, %{cardinality: :many, related: schema, field: field, persist: :map})
+      when is_map(value) do
+    types = schema.__schema__(:dump)
+    {:ok, Enum.into(value, %{}, fn {k, v} -> {k, dump(field, schema, v, types, fun)} end)}
   end
 
   def dump(_value, _fun, _embed) do
@@ -109,7 +134,7 @@ defmodule Ecto.Embedded do
   end
 
   def cast(nil, %{cardinality: :many}), do: {:ok, []}
-  def cast(value, %{cardinality: :many, related: schema}) when is_list(value) do
+  def cast(value, %{cardinality: :many, related: schema}) when is_list(value) or is_map(value) do
     if Enum.all?(value, &Kernel.match?(%{__struct__: ^schema}, &1)) do
       {:ok, value}
     else
@@ -159,12 +184,21 @@ defmodule Ecto.Embedded do
     to_struct(changeset, action, embed, adapter)
   end
 
-  defp prepare_each(%{cardinality: :many} = embed, changesets, adapter, repo, repo_action) do
+  defp prepare_each(%{cardinality: :many, persist: :list} = embed, changesets, adapter, repo, repo_action) do
     for changeset <- changesets,
         action = check_action!(changeset.action, repo_action, embed),
         changeset = run_prepare(changeset, repo),
         prepared = to_struct(changeset, action, embed, adapter),
         do: prepared
+  end
+
+  defp prepare_each(%{cardinality: :many, persist: :map} = embed, changesets, adapter, repo, repo_action) do
+    for {k, changeset} <- changesets,
+        action = check_action!(changeset.action, repo_action, embed),
+        changeset = run_prepare(changeset, repo),
+        prepared = to_struct(changeset, action, embed, adapter),
+        into: %{},
+        do: {k, prepared}
   end
 
   defp to_struct(%Changeset{valid?: false}, _action,

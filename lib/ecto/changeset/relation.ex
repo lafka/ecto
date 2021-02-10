@@ -58,6 +58,13 @@ defmodule Ecto.Changeset.Relation do
     apply_changes(changeset)
   end
 
+  def apply_changes(%{cardinality: :many, persist: :map}, changesets) do
+    for {k, changeset} <- changesets,
+      struct = apply_changes(changeset),
+      into: %{},
+      do: {k, struct}
+  end
+
   def apply_changes(%{cardinality: :many}, changesets) do
     for changeset <- changesets,
       struct = apply_changes(changeset),
@@ -94,21 +101,24 @@ defmodule Ecto.Changeset.Relation do
       _ -> {:ok, nil, true}
     end
   end
-
+  def cast(%{cardinality: :many, persist: :map} = relation, owner, params, current, on_cast) do
+    cast2(relation, owner, params, current, on_cast)
+  end
   def cast(%{cardinality: :many} = relation, owner, params, current, on_cast) when is_map(params) do
     params =
       params
       |> Enum.map(&key_as_int/1)
       |> Enum.sort
       |> Enum.map(&elem(&1, 1))
-    cast(relation, owner, params, current, on_cast)
+    cast2(relation, owner, params, current, on_cast)
   end
 
-  def cast(%{related: mod} = relation, owner, params, current, on_cast) do
-    pks = mod.__schema__(:primary_key)
+  def cast(%{} = relation, owner, params, current, on_cast), do: cast2(relation, owner, params, current, on_cast)
+
+  def cast2(%{} = relation, owner, params, current, on_cast) do
     fun = &do_cast(relation, owner, &1, &2, &3, on_cast)
-    data_pk = data_pk(pks)
-    param_pk = param_pk(mod, pks)
+    data_pk = data_pk(relation)
+    param_pk = param_pk(relation)
 
     with :error <- cast_or_change(relation, params, current, data_pk, param_pk, fun) do
       {:error, {"is invalid", [type: expected_type(relation)]}}
@@ -152,8 +162,16 @@ defmodule Ecto.Changeset.Relation do
     end
   end
 
-  def change(%{related: mod} = relation, value, current) do
-    get_pks = data_pk(mod.__schema__(:primary_key))
+  def change(%{cardinality: :many, persist: :map} = relation, value, {_, current}) do
+    get_pks = data_pk(relation)
+    with :error <- cast_or_change(relation, value, current, get_pks, get_pks,
+                                  &do_change(relation, &1, &2, &3)) do
+      {:error, {"is invalid", [type: expected_type(relation)]}}
+    end
+  end
+
+  def change(%{} = relation, value, current) do
+    get_pks = data_pk(relation)
     with :error <- cast_or_change(relation, value, current, get_pks, get_pks,
                                   &do_change(relation, &1, &2, &3)) do
       {:error, {"is invalid", [type: expected_type(relation)]}}
@@ -246,6 +264,9 @@ defmodule Ecto.Changeset.Relation do
     """
   end
 
+  def on_replace(%{persist: :map}, {k, changeset_or_struct}) do
+    {:ok, Changeset.change(changeset_or_struct) |> put_new_action(:replace)}
+  end
   def on_replace(_relation, changeset_or_struct) do
     {:ok, Changeset.change(changeset_or_struct) |> put_new_action(:replace)}
   end
@@ -286,6 +307,30 @@ defmodule Ecto.Changeset.Relation do
     %{unique: unique, ordered: ordered} = relation
     ordered = if ordered, do: current_pks, else: []
     map_changes(value, new_pks_fun, fun, current_map, [], true, true, unique && %{}, ordered)
+  end
+
+  defp cast_or_change(%{cardinality: :many, persist: :map} = relation, value, current, current_pks_fun, new_pks_fun, fun) do
+    {current_pks, current_map} = process_current(current, current_pks_fun, relation)
+    %{unique: unique, ordered: ordered} = relation
+    ordered = if ordered, do: current_pks, else: []
+
+    # Strip map key and reproduce from primary key
+    value = Map.values(value)
+    with {:ok, value, valid?} <- map_changes(value, new_pks_fun, fun, current_map, [], true, true, unique && %{}, ordered) do
+      value = for v <- value, into: %{} do
+                    applied =
+                      case v do
+                        %Ecto.Changeset{} = v -> Ecto.Changeset.apply_changes(v)
+                        %{__schema__: _} = v -> v
+                      end
+                    k = Ecto.primary_key!(applied)
+                    |> Keyword.values()
+                    |> List.flatten()
+                    |> Enum.join("/")
+                    {k, v}
+                  end
+      {:ok, value, valid?}
+    end
   end
 
   defp cast_or_change(_, _, _, _, _, _), do: :error
@@ -461,7 +506,17 @@ defmodule Ecto.Changeset.Relation do
     end
   end
 
-  defp data_pk(pks) do
+  defp data_pk(%{related: mod, persist: :map} = _relation) do
+    pks = mod.__schema__(:primary_key)
+    fn
+      {_, %Changeset{data: data}} -> Enum.map(pks, &Map.get(data, &1))
+      {_, map} when is_map(map) -> Enum.map(pks, &Map.get(map, &1))
+      {_, list} when is_list(list) -> Enum.map(pks, &Keyword.get(list, &1))
+    end
+  end
+
+  defp data_pk(%{related: mod} = _relation) do
+    pks = mod.__schema__(:primary_key)
     fn
       %Changeset{data: data} -> Enum.map(pks, &Map.get(data, &1))
       map when is_map(map) -> Enum.map(pks, &Map.get(map, &1))
@@ -469,7 +524,8 @@ defmodule Ecto.Changeset.Relation do
     end
   end
 
-  defp param_pk(mod, pks) do
+  defp param_pk(%{related: mod} = _relation) do
+    pks = mod.__schema__(:primary_key)
     pks = Enum.map(pks, &{&1, Atom.to_string(&1), mod.__schema__(:type, &1)})
     fn params ->
       Enum.map pks, fn {atom_key, string_key, type} ->

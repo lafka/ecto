@@ -1920,7 +1920,7 @@ defmodule Ecto.Schema do
     embed(mod, :one, name, schema, opts)
   end
 
-  @valid_embeds_many_options [:strategy, :on_replace, :source]
+  @valid_embeds_many_options [:strategy, :on_replace, :source, :persist]
 
   @doc false
   def __embeds_many__(mod, name, schema, opts) do
